@@ -77,15 +77,23 @@ def node_items(node):
     return []
 
 
-def keyboard(menu, mid, path):
+def keyboard(menu, mid, path, idx=False):
+    """idx=True: القائمة فُتحت من أمر (الازرار) فيظهر زر العودة للقائمة الرئيسية."""
+    sfx = "|1" if idx else ""
     kids = children(menu, path)
     rows = [
-        [Btn(n["name"], callback_data=f"n|{mid}|{join_path(path + [i])}")]
+        [Btn(n["name"], callback_data=f"n|{mid}|{join_path(path + [i])}{sfx}")]
         for i, n in enumerate(kids)
     ]
     if path:
-        rows.append([Btn("🔙 رجوع", callback_data=f"n|{mid}|{join_path(path[:-1])}")])
+        rows.append([Btn("🔙 رجوع", callback_data=f"n|{mid}|{join_path(path[:-1])}{sfx}")])
+    elif idx:
+        rows.append([Btn("🔙 القائمة الرئيسية", callback_data="ix")])
     return Markup(rows)
+
+
+def index_markup(menus):
+    return Markup([[Btn(m["keyword"], callback_data=f"n|{mid}||1")] for mid, m in menus.items()])
 
 
 def breadcrumb(menu, path):
@@ -360,8 +368,8 @@ async def on_create_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------- تصفح القائمة ----------------
 async def on_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    _, mid, p = q.data.split("|")
-    path = parse_path(p)
+    parts = q.data.split("|")
+    mid, path, idx = parts[1], parse_path(parts[2]), len(parts) > 3
     data = load(MENU_FILE)
     menu = data.get(str(q.message.chat.id), {}).get(mid)
     if not menu:
@@ -371,7 +379,8 @@ async def on_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         if not path:
-            await q.edit_message_text("📋 اختر من القائمة:", reply_markup=keyboard(menu, mid, []))
+            title = f"📋 {menu['keyword']}" if idx else "📋 اختر من القائمة:"
+            await q.edit_message_text(title, reply_markup=keyboard(menu, mid, [], idx))
             return
         node = get_node(menu["buttons"], path)
         if not node:
@@ -383,9 +392,22 @@ async def on_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await send_items(q.message, items)
                 text = node["name"]
-            await q.edit_message_text(text, reply_markup=keyboard(menu, mid, path))
+            await q.edit_message_text(text, reply_markup=keyboard(menu, mid, path, idx))
         else:
             await send_items(q.message, items)
+    except BadRequest:
+        pass
+
+
+async def on_index_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    menus = load(MENU_FILE).get(str(q.message.chat.id), {})
+    if not menus:
+        await q.answer("لا توجد قوائم مضافة", show_alert=True)
+        return
+    await q.answer()
+    try:
+        await q.edit_message_text("📚 القوائم المتاحة، اختر ما تريد:", reply_markup=index_markup(menus))
     except BadRequest:
         pass
 
@@ -478,6 +500,13 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("الردود الحالية:\n" + "\n".join(lines) if lines else "لا توجد ردود مضافة بعد")
         return
 
+    if text == "الازرار":
+        if not menus:
+            await msg.reply_text("لا توجد أزرار مضافة بعد")
+        else:
+            await msg.reply_text("📚 القوائم المتاحة، اختر ما تريد:", reply_markup=index_markup(menus))
+        return
+
     # --- الرد التلقائي ---
     for mid, m in menus.items():
         if m["keyword"] == text:
@@ -492,6 +521,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_create_cb, pattern=r"^cr\|"))
     app.add_handler(CallbackQueryHandler(on_edit_cb, pattern=r"^ed\|"))
     app.add_handler(CallbackQueryHandler(on_nav, pattern=r"^n\|"))
+    app.add_handler(CallbackQueryHandler(on_index_cb, pattern=r"^ix$"))
     app.add_handler(
         MessageHandler(
             (filters.TEXT & ~filters.COMMAND) | filters.PHOTO | filters.Document.ALL,
