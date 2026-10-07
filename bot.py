@@ -1,18 +1,21 @@
 # -*- coding: utf-8 -*-
 # pip install "python-telegram-bot>=20"
+import asyncio
 import json
 import os
 import re
+import time
 from datetime import date, datetime, timedelta, timezone
 
 from telegram import InlineKeyboardButton as Btn
 from telegram import InlineKeyboardMarkup as Markup
 from telegram import InputMediaDocument, InputMediaPhoto, Update
 from telegram.constants import ChatMemberStatus
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Forbidden
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
+    CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
@@ -24,6 +27,12 @@ DATA_DIR = os.environ.get("DATA_DIR", ".")
 DB_FILE = os.path.join(DATA_DIR, "replies.json")    # الردود البسيطة
 MENU_FILE = os.path.join(DATA_DIR, "menus.json")    # الردود المتعددة (الأزرار)
 HW_FILE = os.path.join(DATA_DIR, "homework.json")   # التحاضير حسب التاريخ
+USERS_FILE = os.path.join(DATA_DIR, "users.json")   # الطلاب المفعّلون (راسلوا البوت)
+SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")  # إعدادات كل مجموعة
+GROUPS_FILE = os.path.join(DATA_DIR, "groups.json")      # المجموعات التي يعرفها البوت
+OWNER_ID = int(os.environ.get("OWNER_ID", "6970354026"))
+OWNER_USERNAME = os.environ.get("OWNER_USERNAME", "p1oco")
+OWNER_NAME = os.environ.get("OWNER_NAME", "المطوّر")
 TZ_HOURS = float(os.environ.get("TZ_OFFSET", "3"))  # فرق التوقيت عن UTC (الرياض = 3)
 
 
@@ -42,9 +51,31 @@ def save(path, data):
 
 async def is_admin(chat, user_id) -> bool:
     if chat.type == "private":
-        return True
+        return user_id == OWNER_ID      # في الخاص: المالك فقط
     member = await chat.get_member(user_id)
     return member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+
+
+def data_id(chat, user_id):
+    """أي مجموعة نقرأ منها البيانات؟ في الخاص: مجموعة الطالب المفعّل، أو المجموعة التي حددها المالك."""
+    if chat.type != "private":
+        return str(chat.id)
+    if user_id == OWNER_ID:
+        target = load(SETTINGS_FILE).get("_owner", {}).get("target")
+        return target or str(chat.id)
+    for gid, reg in load(USERS_FILE).items():
+        if str(user_id) in reg:
+            return gid
+    return str(chat.id)
+
+
+def remember_group(chat):
+    if chat.type == "private":
+        return
+    groups = load(GROUPS_FILE)
+    if groups.get(str(chat.id), {}).get("title") != chat.title:
+        groups[str(chat.id)] = {"title": chat.title}
+        save(GROUPS_FILE, groups)
 
 
 # ---------------- أدوات الأزرار ----------------
@@ -167,7 +198,7 @@ async def on_edit_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("للمشرفين فقط ⛔", show_alert=True)
         return
     data = load(MENU_FILE)
-    menu = data.get(str(chat.id), {}).get(mid)
+    menu = data.get(data_id(chat, q.from_user.id), {}).get(mid)
     if not menu or (path and get_node(menu["buttons"], path) is None):
         await q.answer("هذا الزر لم يعد موجوداً", show_alert=True)
         return
@@ -232,7 +263,7 @@ def choose_markup(st):
 async def handle_multi(update: Update, st) -> bool:
     """يرجع True إذا تم استهلاك الرسالة."""
     msg = update.message
-    chat_id = str(update.effective_chat.id)
+    chat_id = data_id(update.effective_chat, update.effective_user.id)
     step = st["step"]
 
     if step == "choose":
@@ -283,8 +314,16 @@ async def handle_multi(update: Update, st) -> bool:
         else:
             return True
         st["items"].append(item)
-        label = f"تمت إضافة {len(st['items'])} ✅\nأرسل المزيد (كتاب / ملف / صورة / نص) أو اضغط تم"
-        markup = Markup([[Btn("✅ تم، حفظ الزر", callback_data="cr|fin")]])
+        label = f"تمت إضافة {len(st['items'])} ✅\nأرسل المزيد (كتاب / ملف / صورة / نص) أو اضغط الزر أدناه"
+        if st.get("mode") == "bc":
+            if not st.get("group"):
+                st.setdefault("msg_ids", []).append(msg.message_id)
+            btn_text = "📨 إرسال للجميع"
+        elif st.get("mode") == "hw":
+            btn_text = "✅ تم، حفظ التحضير"
+        else:
+            btn_text = "✅ تم، حفظ الزر"
+        markup = Markup([[Btn(btn_text, callback_data="cr|fin")]])
         if st.get("status"):
             try:
                 await st["status"].edit_text(label, reply_markup=markup)
@@ -314,7 +353,7 @@ async def on_create_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("هذه الأزرار لمن بدأ العملية فقط", show_alert=True)
         return
     act = q.data.split("|")[1]
-    chat_id = str(q.message.chat.id)
+    chat_id = data_id(q.message.chat, q.from_user.id)
 
     # ---- حفظ محتوى الزر ----
     if act == "fin":
@@ -325,6 +364,32 @@ async def on_create_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("أرسل محتوى أولاً", show_alert=True)
             return
         await q.answer()
+
+        if st.get("mode") == "bc":
+            context.chat_data.pop("multi", None)
+            gid = st.get("group", chat_id)
+            reg_n = len(load(USERS_FILE).get(gid, {}))
+            if reg_n == 0:
+                await q.edit_message_text("لا يوجد أعضاء مفعّلون بعد ❌\nانشر أولاً الأمر: رسالة التفعيل")
+                return
+            await q.edit_message_text(f"⏳ جاري الإرسال إلى {reg_n} عضو...")
+            ok, fail = await broadcast(context.bot, gid, st["items"])
+            for m_id in st.get("msg_ids", []):
+                try:
+                    await context.bot.delete_message(q.message.chat.id, m_id)
+                except Exception:
+                    pass
+            text = f"📨 تم الإرسال إلى {ok} عضو ✅"
+            if fail:
+                text += f"\n⚠️ تعذّر الإرسال إلى {fail} (أوقفوا البوت أو حظروه)"
+            try:
+                total = await context.bot.get_chat_member_count(int(gid))
+                left = len(load(USERS_FILE).get(gid, {}))
+                text += f"\n👥 المفعّلون {left} من {total} عضو"
+            except Exception:
+                pass
+            await q.edit_message_text(text)
+            return
 
         if st.get("mode") == "hw":
             hw = load(HW_FILE)
@@ -386,7 +451,7 @@ async def on_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = q.data.split("|")
     mid, path, idx = parts[1], parse_path(parts[2]), len(parts) > 3
     data = load(MENU_FILE)
-    menu = data.get(str(q.message.chat.id), {}).get(mid)
+    menu = data.get(data_id(q.message.chat, q.from_user.id), {}).get(mid)
     if not menu:
         await q.answer("هذه القائمة لم تعد موجودة", show_alert=True)
         return
@@ -414,6 +479,234 @@ async def on_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 
+# ---------------- التفعيل والإذاعة ----------------
+class Target:
+    """يجعل send_items تعمل مع الإرسال لمستخدم في الخاص."""
+
+    def __init__(self, bot, chat_id):
+        self.bot, self.chat_id = bot, chat_id
+
+    async def reply_text(self, text):
+        return await self.bot.send_message(self.chat_id, text)
+
+    async def reply_photo(self, photo, caption=None):
+        return await self.bot.send_photo(self.chat_id, photo, caption=caption)
+
+    async def reply_document(self, doc, caption=None):
+        return await self.bot.send_document(self.chat_id, doc, caption=caption)
+
+    async def reply_media_group(self, media):
+        return await self.bot.send_media_group(self.chat_id, media)
+
+
+def reg_link(bot, group_id):
+    return f"https://t.me/{bot.username}?start=reg_{group_id}"
+
+
+async def delete_later(message, seconds):
+    await asyncio.sleep(seconds)
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
+async def broadcast(bot, group_id, items):
+    users = load(USERS_FILE)
+    reg = users.get(group_id, {})
+    ok = fail = 0
+    for uid in list(reg):
+        try:
+            await send_items(Target(bot, int(uid)), items)
+            ok += 1
+        except Forbidden:       # حظر البوت: نحذفه من المفعّلين
+            reg.pop(uid, None)
+            fail += 1
+        except Exception:
+            fail += 1
+        await asyncio.sleep(0.07)
+    save(USERS_FILE, users)
+    return ok, fail
+
+
+_OWNER_CACHE = {"t": 0, "data": None}
+
+
+async def get_owner(bot):
+    c = _OWNER_CACHE
+    if c["data"] and time.time() - c["t"] < 600:
+        return c["data"]
+    info = {"name": OWNER_NAME, "username": OWNER_USERNAME, "id": OWNER_ID, "bio": None, "photo": None}
+    try:
+        chat = await bot.get_chat(OWNER_ID)
+        info["name"] = chat.full_name or info["name"]
+        if chat.username:
+            info["username"] = chat.username
+        info["bio"] = getattr(chat, "bio", None)
+    except Exception:
+        pass
+    try:
+        photos = await bot.get_user_profile_photos(OWNER_ID, limit=1)
+        if photos.total_count:
+            info["photo"] = photos.photos[0][-1].file_id
+    except Exception:
+        pass
+    c.update(t=time.time(), data=info)
+    return info
+
+
+def build_welcome(first_name, owner):
+    bio = (owner.get("bio") or "").strip()
+    if len(bio) > 120:
+        bio = bio[:117] + "..."
+    lines = [
+        f"👋 أهلاً بك {first_name}!",
+        "",
+        "أنا بوت إدارة مجموعة المدرسة 🎓",
+        "",
+        "✨ وظيفتي:",
+        "📚 عرض التحاضير والواجبات (اليوم / أمس / غداً) وأرشيفها",
+        "📂 عرض القوائم والكتب والأسئلة بأزرار سهلة",
+        "📢 إيصال إشعارات الإدارة لك مباشرة في الخاص",
+        "",
+        "⚙️ كيف أعمل؟",
+        "المشرفون يسجّلون المحتوى في المجموعة، وأنا أحفظه وأعرضه لأي طالب يطلبه، "
+        "وأرسل لك الإشعارات المهمة بعد تفعيل حسابك.",
+        "",
+        "👑 المطوّر والمالك:",
+        f"الاسم: {owner['name']}",
+        f"اليوزر: @{owner['username']}",
+        f"الايدي: {owner['id']}",
+    ]
+    if bio:
+        lines.append(f"النبذة: {bio}")
+    lines += ["", "📖 اكتب «الاوامر» لعرض جميع الأوامر."]
+    return "\n".join(lines)
+
+
+async def send_welcome(bot, chat_id, first_name):
+    owner = await get_owner(bot)
+    text = build_welcome(first_name, owner)
+    markup = Markup([
+        [Btn("👑 تواصل مع المالك", url=f"https://t.me/{owner['username']}")],
+        [Btn("📖 عرض الأوامر", callback_data="help")],
+    ])
+    if owner["photo"]:
+        if len(text) <= 1024:
+            await bot.send_photo(chat_id, owner["photo"], caption=text, reply_markup=markup)
+            return
+        await bot.send_photo(chat_id, owner["photo"])
+    await bot.send_message(chat_id, text, reply_markup=markup)
+
+
+async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg, user = update.message, update.effective_user
+    payload = context.args[0] if context.args else ""
+    if payload.startswith("reg_"):
+        gid = payload[4:]
+        try:
+            member = await context.bot.get_chat_member(int(gid), user.id)
+            is_member = member.status not in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED)
+        except Exception:
+            is_member = False
+        if not is_member:
+            await msg.reply_text("لم أجدك عضواً في المجموعة ❌\nانضم إليها أولاً ثم اضغط زر التفعيل مجدداً.")
+            return
+        users = load(USERS_FILE)
+        users.setdefault(gid, {})[str(user.id)] = {"name": user.full_name, "username": user.username}
+        save(USERS_FILE, users)
+        await msg.reply_text(
+            "تم تفعيل حسابك بنجاح ✅\n"
+            "ستصلك إشعارات الإدارة هنا، ويمكنك الآن الكتابة في المجموعة.\n\n"
+            "📖 اكتب «الاوامر» لعرض جميع الأوامر، ويمكنك استخدامها هنا في الخاص أيضاً.",
+            reply_markup=Markup([[Btn("📖 عرض الأوامر", callback_data="help")]]),
+        )
+        return
+    await send_welcome(context.bot, msg.chat_id, user.first_name)
+
+
+async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg, chat = update.message, update.effective_chat
+    remember_group(chat)
+    cid = str(chat.id)
+    reg = load(USERS_FILE).get(cid, {})
+    users = [u for u in msg.new_chat_members if not u.is_bot and str(u.id) not in reg]
+    if not users:
+        return
+    mentions = "، ".join(u.mention_html() for u in users[:10])
+    note = await msg.reply_text(
+        f"👋 أهلاً {mentions}\n\n"
+        "⚠️ فعّل البوت أولاً حتى تصلك إشعارات الإدارة وتتمكن من استخدام المجموعة بشكل كامل.\n"
+        "اضغط الزر ثم اضغط Start في الخاص 👇",
+        parse_mode="HTML",
+        reply_markup=Markup([[Btn("✅ تفعيل حسابي", url=reg_link(context.bot, cid))]]),
+    )
+    asyncio.create_task(delete_later(note, 600))
+
+
+async def on_target_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != OWNER_ID:
+        await q.answer("للمالك فقط ⛔", show_alert=True)
+        return
+    gid = q.data.split("|", 1)[1]
+    groups = load(GROUPS_FILE)
+    if gid not in groups:
+        await q.answer("المجموعة غير معروفة", show_alert=True)
+        return
+    settings = load(SETTINGS_FILE)
+    settings.setdefault("_owner", {})["target"] = gid
+    save(SETTINGS_FILE, settings)
+    await q.answer()
+    await q.edit_message_text(
+        f"✅ تم تحديد المجموعة: {groups[gid]['title']}\n\n"
+        "الآن يمكنك استخدام:\n"
+        "• اذاعة — لإرسال رسالة لمفعّليها\n"
+        "• المفعلين — لعرض حساباتهم"
+    )
+
+
+def chunk_lines(lines, limit=3500):
+    out, cur = [], ""
+    for ln in lines:
+        if len(cur) + len(ln) + 1 > limit:
+            out.append(cur)
+            cur = ""
+        cur += ln + "\n"
+    if cur:
+        out.append(cur)
+    return out
+
+
+async def enforce_registration(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """يحذف رسالة غير المفعّل إذا كان الإجبار شغالاً. يرجع True إذا حُذفت."""
+    chat, msg, user = update.effective_chat, update.message, update.effective_user
+    cid = str(chat.id)
+    if not load(SETTINGS_FILE).get(cid, {}).get("force"):
+        return False
+    if user.is_bot or msg.sender_chat:
+        return False
+    if str(user.id) in load(USERS_FILE).get(cid, {}):
+        return False
+    if await is_admin(chat, user.id):
+        return False
+    try:
+        await msg.delete()
+    except Exception:
+        return False        # البوت لا يملك صلاحية الحذف
+    warned = context.chat_data.setdefault("warned", {})
+    if time.time() - warned.get(user.id, 0) > 60:
+        warned[user.id] = time.time()
+        note = await chat.send_message(
+            f"⚠️ {user.mention_html()} يجب تفعيل حسابك أولاً حتى تتمكن من الكتابة في المجموعة.\n"
+            "اضغط الزر ثم اضغط Start في الخاص 👇",
+            parse_mode="HTML",
+            reply_markup=Markup([[Btn("✅ تفعيل حسابي", url=reg_link(context.bot, cid))]]),
+        )
+        asyncio.create_task(delete_later(note, 30))
+    return True
+
+
 # ---------------- التحاضير ----------------
 WEEKDAYS = ["الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد"]
 DAY_WORDS = {"اليوم": 0, "امس": -1, "باجر": 1, "غدا": 1, "بكره": 1, "بكرا": 1}
@@ -423,25 +716,66 @@ HW_ADD = re.compile(rf"^اضف\s+({HW_WORDS})\s+(\S+)$")
 HW_DEL = re.compile(rf"^حذف\s+({HW_WORDS})\s+(\S+)$")
 _AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 
-HELP_TEXT = """📖 أوامر البوت
+HELP_STUDENT = """📖 دليل الأوامر
 
-👥 للجميع:
-• الازرار — يعرض كل القوائم المضافة لتختار منها
+📚 التحاضير والواجبات
+• تحاضير اليوم — تحضير اليوم
+• تحاضير امس — تحضير أمس
+• تحاضير باجر — تحضير الغد
+• واجبات اليوم / امس / باجر — نفس الشيء
+• التحاضير — أرشيف كل الأيام (اختر الشهر ثم اليوم)
+
+📂 القوائم والكتب والأسئلة
+• الازرار — يعرض كل القوائم لتختار منها
+• أو اكتب اسم القائمة مباشرة، مثل: اساله
 • الردود — يعرض الكلمات التي يرد عليها البوت
-• تحاضير اليوم — تحضير اليوم (ونفس الشيء: تحاضير امس / تحاضير باجر)
-• واجبات اليوم — نفس التحاضير (واجبات امس / واجبات باجر)
-• التحاضير — أرشيف التحاضير: اختر الشهر ثم اليوم
-• الاوامر — عرض هذه الرسالة
-• أي كلمة مضافة (مثل اساله) — يرد عليها البوت أو يعرض أزرارها
 
-🔒 للمشرفين فقط:
-• اضف رد كلمة — يضيف رداً بسيطاً (يسألك عن الرد ثم يحفظه)
-• اضف رد متعدد — يضيف قائمة أزرار، وكل زر فيه نص أو كتب أو صور، ويمكن وضع أزرار داخل أزرار
-• تعديل رد كلمة — تعديل قائمة الأزرار (إضافة زر، حذف، تغيير الاسم أو المحتوى)
-• حذف رد كلمة — يحذف الرد أو القائمة كاملة
-• اضف تحضير اليوم — تسجيل تحضير بتاريخ اليوم (أو امس / باجر / تاريخ مثل 2026-10-12)، ثم أرسل المحتوى (رسائل / ملفات / صور) واضغط ✅ تم
+🔔 تفعيل الحساب
+• اضغط زر «تفعيل حسابي» ثم Start
+  لتصلك إشعارات الإدارة في الخاص
+
+ℹ️ اكتب «الاوامر» في أي وقت لعرض هذه القائمة"""
+
+HELP_ADMIN = """🔒 أوامر المشرفين (داخل المجموعة)
+
+📚 التحاضير
+• اضف تحضير اليوم — ثم أرسل المحتوى واضغط «تم»
+  (يمكنك كتابة: امس / باجر / تاريخ مثل 2026-10-12)
 • حذف تحضير اليوم — يحذف تحضير ذلك اليوم
-• الغاء — يلغي أي عملية إضافة جارية"""
+
+💬 الردود والقوائم
+• اضف رد كلمة — رد بسيط: يسألك عن الرد ثم يحفظه
+• اضف رد متعدد — قائمة أزرار فيها نصوص وكتب وصور، ويمكن وضع أزرار داخل أزرار
+• تعديل رد كلمة — تعديل القائمة (إضافة زر، حذف، تغيير الاسم أو المحتوى)
+• حذف رد كلمة — يحذف الرد أو القائمة كاملة
+
+🔔 التفعيل والإذاعة
+• رسالة التفعيل — ينشر رسالة بزر تفعيل الحساب
+• المفعلين — عدد المفعّلين من إجمالي الأعضاء
+• اذاعة — يرسل رسالتك في الخاص لكل المفعّلين
+• اجبار التفعيل — يحذف رسائل غير المفعّلين حتى يفعّلوا
+• ايقاف الاجبار — يوقف الإجبار
+
+❌ الغاء — يلغي أي عملية جارية"""
+
+HELP_OWNER = """👑 أوامر المالك (في الخاص مع البوت)
+
+• المجموعات — اختيار المجموعة التي تتعامل معها
+• المجموعة الحالية — يعرض المجموعة المحددة
+• المفعلين — قائمة حسابات المفعّلين (الاسم واليوزر والايدي)
+• اذاعة — يرسل رسالتك لكل مفعّلي المجموعة المحددة
+
+💡 بعد تحديد المجموعة تعمل أوامر المشرفين (مثل اضف تحضير) هنا في الخاص على تلك المجموعة."""
+
+
+async def help_for(chat, user_id):
+    parts = [HELP_STUDENT]
+    if chat.type == "private":
+        if user_id == OWNER_ID:
+            parts += [HELP_ADMIN, HELP_OWNER]
+    elif await is_admin(chat, user_id):
+        parts.append(HELP_ADMIN)
+    return "\n\n".join(parts)
 
 
 def today():
@@ -498,7 +832,7 @@ async def on_hw_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     parts = q.data.split("|")
     act = parts[1]
-    hw = {k: v for k, v in load(HW_FILE).get(str(q.message.chat.id), {}).items() if v}
+    hw = {k: v for k, v in load(HW_FILE).get(data_id(q.message.chat, q.from_user.id), {}).items() if v}
     try:
         if act == "d":
             items = hw.get(parts[2])
@@ -538,12 +872,12 @@ async def on_hw_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_help_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    await q.message.reply_text(HELP_TEXT)
+    await q.message.reply_text(await help_for(q.message.chat, q.from_user.id))
 
 
 async def on_index_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    menus = load(MENU_FILE).get(str(q.message.chat.id), {})
+    menus = load(MENU_FILE).get(data_id(q.message.chat, q.from_user.id), {})
     if not menus:
         await q.answer("لا توجد قوائم مضافة", show_alert=True)
         return
@@ -561,8 +895,13 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user_id = update.effective_user.id
     chat = update.effective_chat
-    chat_id = str(chat.id)
+    chat_id = data_id(chat, user_id)
     cd = context.chat_data
+
+    if chat.type != "private":
+        remember_group(chat)
+        if await enforce_registration(update, context):
+            return
 
     # حالة إضافة / تعديل رد متعدد
     st = cd.get("multi")
@@ -645,7 +984,14 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ntext = norm(text)
 
     if ntext == "الاوامر":
-        await msg.reply_text(HELP_TEXT)
+        await msg.reply_text(await help_for(chat, user_id))
+        return
+
+    if chat.type == "private" and user_id != OWNER_ID and chat_id == str(chat.id):
+        await msg.reply_text(
+            "فعّل حسابك أولاً حتى أستطيع خدمتك هنا 🔔\n"
+            "اضغط زر «تفعيل حسابي» في رسالة المجموعة ثم اضغط Start."
+        )
         return
 
     if ntext == "التحاضير":
@@ -654,6 +1000,107 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text("لا توجد تحاضير مسجلة بعد")
         else:
             await msg.reply_text("📚 اختر الشهر:", reply_markup=months_markup(hw))
+        return
+
+    if chat.type == "private" and user_id == OWNER_ID and ntext in (
+        "المجموعات", "تحديد المجموعه", "المجموعه الحاليه", "المفعلين", "اذاعه"
+    ):
+        groups = load(GROUPS_FILE)
+        target = load(SETTINGS_FILE).get("_owner", {}).get("target")
+        title = groups.get(target, {}).get("title", target) if target else None
+
+        if ntext in ("المجموعات", "تحديد المجموعه"):
+            if not groups:
+                await msg.reply_text(
+                    "لا توجد مجموعات معروفة بعد.\n"
+                    "أضف البوت لمجموعتك واكتب فيها أي رسالة ليتعرف عليها، ثم أعد المحاولة."
+                )
+            else:
+                rows = [
+                    [Btn(("✅ " if gid == target else "📍 ") + g["title"], callback_data=f"tg|{gid}")]
+                    for gid, g in groups.items()
+                ]
+                await msg.reply_text("اختر المجموعة التي تريد التعامل معها:", reply_markup=Markup(rows))
+        elif ntext == "المجموعه الحاليه":
+            await msg.reply_text(
+                f"📍 المجموعة المحددة: {title}" if target else "لم تحدد مجموعة بعد. اكتب: المجموعات"
+            )
+        elif not target:
+            await msg.reply_text("حدد المجموعة أولاً: اكتب «المجموعات»")
+        elif ntext == "المفعلين":
+            reg = load(USERS_FILE).get(target, {})
+            if not reg:
+                await msg.reply_text(f"لا يوجد مفعّلون في «{title}» بعد")
+            else:
+                lines = []
+                for i, (uid, u) in enumerate(reg.items(), 1):
+                    uname = f" (@{u['username']})" if u.get("username") else ""
+                    lines.append(f"{i}. {u.get('name', '—')}{uname} — {uid}")
+                try:
+                    total = await context.bot.get_chat_member_count(int(target))
+                except Exception:
+                    total = None
+                header = f"👥 المفعّلون في «{title}»: {len(reg)}" + (f" من {total} عضو" if total else "")
+                chunks = chunk_lines(lines)
+                await msg.reply_text(header + "\n\n" + chunks[0])
+                for c in chunks[1:]:
+                    await msg.reply_text(c)
+        else:  # اذاعه
+            cd["multi"] = {"user": user_id, "step": "content", "mode": "bc", "items": [],
+                           "status": None, "msg_ids": [], "group": target}
+            await msg.reply_text(
+                f"📢 الإرسال إلى مفعّلي «{title}»\n"
+                "أرسل الرسالة (نص / صور / ملفات)، ويمكنك إرسال أكثر من رسالة، "
+                "ثم اضغط 📨 إرسال للجميع.\nللإلغاء اكتب: الغاء"
+            )
+        return
+
+    if ntext in ("رساله التفعيل", "اجبار التفعيل", "ايقاف الاجبار", "المفعلين", "اذاعه"):
+        if chat.type == "private":
+            await msg.reply_text("هذا الأمر يُستخدم داخل المجموعة")
+            return
+        if not await is_admin(chat, user_id):
+            await msg.reply_text("هذا الأمر للمشرفين فقط ⛔")
+            return
+
+        if ntext == "رساله التفعيل":
+            await msg.reply_text(
+                "🔔 لتفعيل حسابك واستلام إشعارات الإدارة في الخاص:\n"
+                "اضغط الزر ثم اضغط Start في محادثة البوت 👇",
+                reply_markup=Markup([[Btn("✅ تفعيل حسابي", url=reg_link(context.bot, chat_id))]]),
+            )
+
+        elif ntext in ("اجبار التفعيل", "ايقاف الاجبار"):
+            on = ntext == "اجبار التفعيل"
+            settings = load(SETTINGS_FILE)
+            settings.setdefault(chat_id, {})["force"] = on
+            save(SETTINGS_FILE, settings)
+            if on:
+                await msg.reply_text(
+                    "تم تشغيل الإجبار ✅\nسيحذف البوت رسائل غير المفعّلين مع تنبيههم بزر التفعيل.\n"
+                    "(يلزم أن يكون البوت مشرفاً بصلاحية حذف الرسائل)"
+                )
+            else:
+                await msg.reply_text("تم إيقاف الإجبار ✅")
+
+        elif ntext == "المفعلين":
+            reg_n = len(load(USERS_FILE).get(chat_id, {}))
+            force = load(SETTINGS_FILE).get(chat_id, {}).get("force")
+            try:
+                total = await chat.get_member_count()
+            except Exception:
+                total = "؟"
+            await msg.reply_text(
+                f"👥 المفعّلون: {reg_n} من {total} عضو\nالإجبار: {'شغّال ✅' if force else 'متوقف'}"
+            )
+
+        else:  # اذاعه
+            cd["multi"] = {"user": user_id, "step": "content", "mode": "bc",
+                           "items": [], "status": None, "msg_ids": []}
+            await msg.reply_text(
+                "📢 أرسل الرسالة التي تريد إرسالها لكل المفعّلين (نص / صور / ملفات)،\n"
+                "ويمكنك إرسال أكثر من رسالة، ثم اضغط 📨 إرسال للجميع.\nللإلغاء اكتب: الغاء"
+            )
         return
 
     m = HW_ADD.match(ntext)
@@ -716,6 +1163,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", on_start, filters=filters.ChatType.PRIVATE))
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
+    app.add_handler(CallbackQueryHandler(on_target_cb, pattern=r"^tg\|"))
     app.add_handler(CallbackQueryHandler(on_create_cb, pattern=r"^cr\|"))
     app.add_handler(CallbackQueryHandler(on_edit_cb, pattern=r"^ed\|"))
     app.add_handler(CallbackQueryHandler(on_nav, pattern=r"^n\|"))
@@ -724,7 +1174,8 @@ def main():
     app.add_handler(CallbackQueryHandler(on_help_cb, pattern=r"^help$"))
     app.add_handler(
         MessageHandler(
-            (filters.TEXT & ~filters.COMMAND) | filters.PHOTO | filters.Document.ALL,
+            (filters.TEXT & ~filters.COMMAND) | filters.PHOTO | filters.Document.ALL
+            | filters.Sticker.ALL | filters.VOICE | filters.VIDEO | filters.AUDIO | filters.ANIMATION,
             on_message,
         )
     )
