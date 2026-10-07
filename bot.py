@@ -529,6 +529,40 @@ async def broadcast(bot, group_id, items):
     return ok, fail
 
 
+def known_groups():
+    """كل المجموعات التي للبوت علاقة بها (من الملفات المحفوظة)."""
+    ids = set(load(GROUPS_FILE))
+    for f in (MENU_FILE, DB_FILE, HW_FILE, USERS_FILE):
+        ids |= set(load(f))
+    ids |= {k for k in load(SETTINGS_FILE) if k != "_owner"}
+    return [g for g in ids if g.startswith("-")]
+
+
+async def auto_register(bot, user):
+    """يفعّل المستخدم تلقائياً في كل مجموعة معروفة هو عضو فيها. يرجع قائمة المجموعات المفعّل فيها."""
+    done = []
+    users = load(USERS_FILE)
+    changed = False
+    for gid in known_groups():
+        if str(user.id) in users.get(gid, {}):
+            done.append(gid)
+            continue
+        try:
+            m = await bot.get_chat_member(int(gid), user.id)
+        except Exception:
+            continue
+        if m.status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED):
+            continue
+        if m.status == ChatMemberStatus.RESTRICTED and not getattr(m, "is_member", True):
+            continue
+        users.setdefault(gid, {})[str(user.id)] = {"name": user.full_name, "username": user.username}
+        done.append(gid)
+        changed = True
+    if changed:
+        save(USERS_FILE, users)
+    return done
+
+
 _OWNER_CACHE = {"t": 0, "data": None}
 
 
@@ -623,6 +657,8 @@ async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     await send_welcome(context.bot, msg.chat_id, user.first_name)
+    if await auto_register(context.bot, user):
+        await msg.reply_text("✅ تم تفعيل حسابك تلقائياً، وستصلك إشعارات الإدارة هنا.")
 
 
 async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -897,6 +933,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     chat_id = data_id(chat, user_id)
     cd = context.chat_data
+
+    # طالب راسل البوت في الخاص ولم يُسجَّل بعد: نفعّله تلقائياً إن كان عضواً في المجموعة
+    if chat.type == "private" and user_id != OWNER_ID and chat_id == str(chat.id):
+        if await auto_register(context.bot, update.effective_user):
+            chat_id = data_id(chat, user_id)
+            await msg.reply_text("✅ تم تفعيل حسابك تلقائياً، وستصلك إشعارات الإدارة هنا.")
 
     if chat.type != "private":
         remember_group(chat)
