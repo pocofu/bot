@@ -2,6 +2,8 @@
 # pip install "python-telegram-bot>=20"
 import json
 import os
+import re
+from datetime import date, datetime, timedelta, timezone
 
 from telegram import InlineKeyboardButton as Btn
 from telegram import InlineKeyboardMarkup as Markup
@@ -21,6 +23,8 @@ TOKEN = os.environ.get("BOT_TOKEN", "ضع_التوكن_هنا")
 DATA_DIR = os.environ.get("DATA_DIR", ".")
 DB_FILE = os.path.join(DATA_DIR, "replies.json")    # الردود البسيطة
 MENU_FILE = os.path.join(DATA_DIR, "menus.json")    # الردود المتعددة (الأزرار)
+HW_FILE = os.path.join(DATA_DIR, "homework.json")   # التحاضير حسب التاريخ
+TZ_HOURS = float(os.environ.get("TZ_OFFSET", "3"))  # فرق التوقيت عن UTC (الرياض = 3)
 
 
 # ---------------- التخزين ----------------
@@ -93,7 +97,9 @@ def keyboard(menu, mid, path, idx=False):
 
 
 def index_markup(menus):
-    return Markup([[Btn(m["keyword"], callback_data=f"n|{mid}||1")] for mid, m in menus.items()])
+    rows = [[Btn(m["keyword"], callback_data=f"n|{mid}||1")] for mid, m in menus.items()]
+    rows.append([Btn("📖 عرض الأوامر", callback_data="help")])
+    return Markup(rows)
 
 
 def breadcrumb(menu, path):
@@ -319,6 +325,15 @@ async def on_create_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("أرسل محتوى أولاً", show_alert=True)
             return
         await q.answer()
+
+        if st.get("mode") == "hw":
+            hw = load(HW_FILE)
+            hw.setdefault(chat_id, {}).setdefault(st["date"], []).extend(st["items"])
+            save(HW_FILE, hw)
+            context.chat_data.pop("multi", None)
+            await q.edit_message_text(f"تم حفظ التحضير بنجاح ✅\n📅 {st['label']}")
+            return
+
         data = load(MENU_FILE)
         menu = data[chat_id][st["menu"]]
 
@@ -397,6 +412,133 @@ async def on_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_items(q.message, items)
     except BadRequest:
         pass
+
+
+# ---------------- التحاضير ----------------
+WEEKDAYS = ["الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد"]
+DAY_WORDS = {"اليوم": 0, "امس": -1, "باجر": 1, "غدا": 1, "بكره": 1, "بكرا": 1}
+HW_WORDS = "تحاضير|تحضير|واجبات|واجب"
+HW_VIEW = re.compile(rf"^({HW_WORDS})\s+(\S+)$")
+HW_ADD = re.compile(rf"^اضف\s+({HW_WORDS})\s+(\S+)$")
+HW_DEL = re.compile(rf"^حذف\s+({HW_WORDS})\s+(\S+)$")
+_AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+
+HELP_TEXT = """📖 أوامر البوت
+
+👥 للجميع:
+• الازرار — يعرض كل القوائم المضافة لتختار منها
+• الردود — يعرض الكلمات التي يرد عليها البوت
+• تحاضير اليوم — تحضير اليوم (ونفس الشيء: تحاضير امس / تحاضير باجر)
+• واجبات اليوم — نفس التحاضير (واجبات امس / واجبات باجر)
+• التحاضير — أرشيف التحاضير: اختر الشهر ثم اليوم
+• الاوامر — عرض هذه الرسالة
+• أي كلمة مضافة (مثل اساله) — يرد عليها البوت أو يعرض أزرارها
+
+🔒 للمشرفين فقط:
+• اضف رد كلمة — يضيف رداً بسيطاً (يسألك عن الرد ثم يحفظه)
+• اضف رد متعدد — يضيف قائمة أزرار، وكل زر فيه نص أو كتب أو صور، ويمكن وضع أزرار داخل أزرار
+• تعديل رد كلمة — تعديل قائمة الأزرار (إضافة زر، حذف، تغيير الاسم أو المحتوى)
+• حذف رد كلمة — يحذف الرد أو القائمة كاملة
+• اضف تحضير اليوم — تسجيل تحضير بتاريخ اليوم (أو امس / باجر / تاريخ مثل 2026-10-12)، ثم أرسل المحتوى (رسائل / ملفات / صور) واضغط ✅ تم
+• حذف تحضير اليوم — يحذف تحضير ذلك اليوم
+• الغاء — يلغي أي عملية إضافة جارية"""
+
+
+def today():
+    return (datetime.now(timezone.utc) + timedelta(hours=TZ_HOURS)).date()
+
+
+def norm(t):
+    t = t.translate(_AR_DIGITS)
+    for a, b in (("أ", "ا"), ("إ", "ا"), ("آ", "ا"), ("ة", "ه"), ("ى", "ي"), ("ً", "")):
+        t = t.replace(a, b)
+    return t.strip()
+
+
+def parse_day(word):
+    w = norm(word)
+    if w in DAY_WORDS:
+        return today() + timedelta(days=DAY_WORDS[w])
+    m = re.fullmatch(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", w)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+    return None
+
+
+def day_label(d):
+    return f"{WEEKDAYS[d.weekday()]} {d.isoformat()}"
+
+
+def month_label(ym, with_year):
+    return f"شهر {int(ym[5:])}" + (f" ({ym[:4]})" if with_year else "")
+
+
+def months_markup(hw):
+    yms = sorted({k[:7] for k in hw if hw[k]})
+    with_year = len({ym[:4] for ym in yms}) > 1
+    btns = [Btn(month_label(ym, with_year), callback_data=f"hw|m|{ym}") for ym in yms]
+    rows = [btns[i:i + 3] for i in range(0, len(btns), 3)]
+    rows.append([Btn("📖 عرض الأوامر", callback_data="help")])
+    return Markup(rows)
+
+
+async def show_hw(msg, chat_id, d):
+    items = load(HW_FILE).get(chat_id, {}).get(d.isoformat())
+    if not items:
+        await msg.reply_text(f"لا يوجد تحضير مسجّل ليوم {day_label(d)}")
+        return
+    await msg.reply_text(f"📚 تحاضير {day_label(d)}")
+    await send_items(msg, items)
+
+
+async def on_hw_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    parts = q.data.split("|")
+    act = parts[1]
+    hw = {k: v for k, v in load(HW_FILE).get(str(q.message.chat.id), {}).items() if v}
+    try:
+        if act == "d":
+            items = hw.get(parts[2])
+            if not items:
+                await q.answer("لا يوجد تحضير لهذا اليوم", show_alert=True)
+                return
+            await q.answer()
+            d = date.fromisoformat(parts[2])
+            await q.message.reply_text(f"📚 تحاضير {day_label(d)}")
+            await send_items(q.message, items)
+            return
+
+        if not hw:
+            await q.answer("لا توجد تحاضير مسجلة", show_alert=True)
+            return
+        await q.answer()
+
+        if act == "r":
+            await q.edit_message_text("📚 اختر الشهر:", reply_markup=months_markup(hw))
+        elif act == "m":
+            ym = parts[2]
+            with_year = len({k[:4] for k in hw}) > 1
+            days = sorted(k for k in hw if k.startswith(ym))
+            btns = []
+            for k in days:
+                d = date.fromisoformat(k)
+                btns.append(Btn(f"{WEEKDAYS[d.weekday()]} {d.day}", callback_data=f"hw|d|{k}"))
+            rows = [btns[i:i + 3] for i in range(0, len(btns), 3)]
+            rows.append([Btn("🔙 رجوع", callback_data="hw|r")])
+            await q.edit_message_text(
+                f"📅 {month_label(ym, with_year)} — اختر اليوم:", reply_markup=Markup(rows)
+            )
+    except BadRequest:
+        pass
+
+
+async def on_help_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.message.reply_text(HELP_TEXT)
 
 
 async def on_index_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -500,6 +642,62 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("الردود الحالية:\n" + "\n".join(lines) if lines else "لا توجد ردود مضافة بعد")
         return
 
+    ntext = norm(text)
+
+    if ntext == "الاوامر":
+        await msg.reply_text(HELP_TEXT)
+        return
+
+    if ntext == "التحاضير":
+        hw = {k: v for k, v in load(HW_FILE).get(chat_id, {}).items() if v}
+        if not hw:
+            await msg.reply_text("لا توجد تحاضير مسجلة بعد")
+        else:
+            await msg.reply_text("📚 اختر الشهر:", reply_markup=months_markup(hw))
+        return
+
+    m = HW_ADD.match(ntext)
+    if m:
+        if not await is_admin(chat, user_id):
+            await msg.reply_text("هذا الأمر للمشرفين فقط ⛔")
+            return
+        d = parse_day(m.group(2))
+        if not d:
+            await msg.reply_text("اكتب اليوم هكذا: اليوم / امس / باجر / 2026-10-12")
+            return
+        cd["multi"] = {"user": user_id, "step": "content", "mode": "hw", "date": d.isoformat(),
+                       "label": day_label(d), "items": [], "status": None}
+        await msg.reply_text(
+            f"📅 تحضير {day_label(d)}\n"
+            "أرسل المحتوى (رسائل / ملفات / صور) ويمكنك إرسال أكثر من واحد، "
+            "ثم اضغط ✅ تم.\nللإلغاء اكتب: الغاء"
+        )
+        return
+
+    m = HW_DEL.match(ntext)
+    if m:
+        if not await is_admin(chat, user_id):
+            await msg.reply_text("هذا الأمر للمشرفين فقط ⛔")
+            return
+        d = parse_day(m.group(2))
+        if not d:
+            await msg.reply_text("اكتب اليوم هكذا: اليوم / امس / باجر / 2026-10-12")
+            return
+        hw = load(HW_FILE)
+        if hw.get(chat_id, {}).pop(d.isoformat(), None) is not None:
+            save(HW_FILE, hw)
+            await msg.reply_text(f"تم حذف تحضير {day_label(d)} 🗑️")
+        else:
+            await msg.reply_text("لا يوجد تحضير مسجّل بهذا اليوم")
+        return
+
+    m = HW_VIEW.match(ntext)
+    if m:
+        d = parse_day(m.group(2))
+        if d:
+            await show_hw(msg, chat_id, d)
+            return
+
     if text == "الازرار":
         if not menus:
             await msg.reply_text("لا توجد أزرار مضافة بعد")
@@ -522,6 +720,8 @@ def main():
     app.add_handler(CallbackQueryHandler(on_edit_cb, pattern=r"^ed\|"))
     app.add_handler(CallbackQueryHandler(on_nav, pattern=r"^n\|"))
     app.add_handler(CallbackQueryHandler(on_index_cb, pattern=r"^ix$"))
+    app.add_handler(CallbackQueryHandler(on_hw_cb, pattern=r"^hw\|"))
+    app.add_handler(CallbackQueryHandler(on_help_cb, pattern=r"^help$"))
     app.add_handler(
         MessageHandler(
             (filters.TEXT & ~filters.COMMAND) | filters.PHOTO | filters.Document.ALL,
